@@ -16,6 +16,8 @@ import pathlib
 from tqdm import tqdm
 from typing import List, Tuple, Optional
 from env import AttrDict
+import torchaudio
+
 
 MAX_WAV_VALUE = 32767.0  # NOTE: 32768.0 -1 to prevent int16 overflow (results in popping sound in corner cases)
 
@@ -43,9 +45,16 @@ def spectral_normalize_torch(magnitudes):
 def spectral_de_normalize_torch(magnitudes):
     return dynamic_range_decompression_torch(magnitudes)
 
+def safe_log(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    # giống Vocos: log trên giá trị đã clamp để tránh log(0)
+    return torch.log(x.clamp(min=eps))
+
 
 mel_basis_cache = {}
 hann_window_cache = {}
+
+# cache MelSpectrogram để không tạo lại nhiều lần
+mel_transform_cache = {}
 
 
 def mel_spectrogram(
@@ -57,67 +66,59 @@ def mel_spectrogram(
     win_size: int,
     fmin: int,
     fmax: int = None,
-    center: bool = False,
+    center: bool = True,  # dùng như Vocos: center=True <=> padding="center"
 ) -> torch.Tensor:
     """
-    Calculate the mel spectrogram of an input signal.
-    This function uses slaney norm for the librosa mel filterbank (using librosa.filters.mel) and uses Hann window for STFT (using torch.stft).
+    Mel spectrogram theo kiểu Vocos:
 
-    Args:
-        y (torch.Tensor): Input signal.
-        n_fft (int): FFT size.
-        num_mels (int): Number of mel bins.
-        sampling_rate (int): Sampling rate of the input signal.
-        hop_size (int): Hop size for STFT.
-        win_size (int): Window size for STFT.
-        fmin (int): Minimum frequency for mel filterbank.
-        fmax (int): Maximum frequency for mel filterbank. If None, defaults to half the sampling rate (fmax = sr / 2.0) inside librosa_mel_fn
-        center (bool): Whether to pad the input to center the frames. Default is False.
-
-    Returns:
-        torch.Tensor: Mel spectrogram.
+    - Dùng torchaudio.transforms.MelSpectrogram
+    - power=1 (biên độ, không phải power=2)
+    - Cuối cùng dùng safe_log(mel)
+    - center=True  => padding="center" (MelSpectrogram tự center)
+    - center=False => padding="same"  (tự pad reflect giống Vocos)
     """
+
     if torch.min(y) < -1.0:
         print(f"[WARNING] Min value of input waveform signal is {torch.min(y)}")
     if torch.max(y) > 1.0:
         print(f"[WARNING] Max value of input waveform signal is {torch.max(y)}")
 
     device = y.device
-    key = f"{n_fft}_{num_mels}_{sampling_rate}_{hop_size}_{win_size}_{fmin}_{fmax}_{device}"
+    padding_mode = "center" if center else "same"
 
-    if key not in mel_basis_cache:
-        mel = librosa_mel_fn(
-            sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax
-        )
-        mel_basis_cache[key] = torch.from_numpy(mel).float().to(device)
-        hann_window_cache[key] = torch.hann_window(win_size).to(device)
+    key = f"{n_fft}_{num_mels}_{sampling_rate}_{hop_size}_{win_size}_{fmin}_{fmax}_{padding_mode}_{device}"
 
-    mel_basis = mel_basis_cache[key]
-    hann_window = hann_window_cache[key]
+    # Tạo / lấy MelSpectrogram giống Vocos
+    if key not in mel_transform_cache:
+        mel_spec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sampling_rate,
+            n_fft=n_fft,
+            win_length=win_size,
+            hop_length=hop_size,
+            n_mels=num_mels,
+            f_min=fmin,
+            f_max=fmax,
+            center=(padding_mode == "center"),
+            power=1.0,  # Vocos dùng power=1
+        ).to(device)
 
-    padding = (n_fft - hop_size) // 2
-    y = torch.nn.functional.pad(
-        y.unsqueeze(1), (padding, padding), mode="reflect"
-    ).squeeze(1)
+        mel_transform_cache[key] = mel_spec
 
-    spec = torch.stft(
-        y,
-        n_fft,
-        hop_length=hop_size,
-        win_length=win_size,
-        window=hann_window,
-        center=center,
-        pad_mode="reflect",
-        normalized=False,
-        onesided=True,
-        return_complex=True,
-    )
-    spec = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
+    mel_transform = mel_transform_cache[key]
 
-    mel_spec = torch.matmul(mel_basis, spec)
-    mel_spec = spectral_normalize_torch(mel_spec)
+    audio = y
+    # padding="same" như trong MelSpectrogramFeatures của Vocos
+    if padding_mode == "same":
+        pad = mel_transform.win_length - mel_transform.hop_length
+        audio = torch.nn.functional.pad(audio, (pad // 2, pad // 2), mode="reflect")
 
-    return mel_spec
+    # torchaudio MelSpectrogram chấp nhận shape (B, T) nên dùng trực tiếp
+    mel = mel_transform(audio)  # [B, n_mels, frames]
+
+    # Giống Vocos: log trên mel
+    mel = safe_log(mel)
+    return mel
+
 
 
 def get_mel_spectrogram(wav, h):
@@ -126,10 +127,11 @@ def get_mel_spectrogram(wav, h):
 
     Args:
         wav (torch.Tensor): Input waveform.
-        h: Hyperparameters object with attributes n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax.
+        h: Hyperparameters object with attributes
+           n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax.
 
     Returns:
-        torch.Tensor: Mel spectrogram.
+        torch.Tensor: Mel spectrogram (kiểu Vocos).
     """
     return mel_spectrogram(
         wav,
@@ -140,6 +142,7 @@ def get_mel_spectrogram(wav, h):
         h.win_size,
         h.fmin,
         h.fmax,
+        center=True,  # tương đương padding="center" trong MelSpectrogramFeatures
     )
 
 
