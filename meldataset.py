@@ -45,7 +45,7 @@ def spectral_normalize_torch(magnitudes):
 def spectral_de_normalize_torch(magnitudes):
     return dynamic_range_decompression_torch(magnitudes)
 
-def safe_log(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+def safe_log(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     # giống Vocos: log trên giá trị đã clamp để tránh log(0)
     return torch.log(x.clamp(min=eps))
 
