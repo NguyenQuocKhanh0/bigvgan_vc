@@ -462,9 +462,30 @@ class BigVGAN(
         model = cls(h, use_cuda_kernel=use_cuda_kernel)
 
         # Download and load pretrained generator weight
+        # Download and load pretrained generator weight
         if os.path.isdir(model_id):
             print("Loading weights from local directory")
-            model_file = os.path.join(model_id, "bigvgan_generator.pt")
+
+            # Ưu tiên file theo chuẩn HF
+            hf_style = os.path.join(model_id, "bigvgan_generator.pt")
+            if os.path.isfile(hf_style):
+                model_file = hf_style
+            else:
+                # Fallback: tìm file checkpoint kiểu train: g_XXXXXX
+                g_candidates = sorted(
+                    f for f in os.listdir(model_id)
+                    if f.startswith("g_")
+                )
+                if not g_candidates:
+                    raise FileNotFoundError(
+                        f"Không tìm thấy bigvgan_generator.pt hoặc g_* trong thư mục {model_id}"
+                    )
+
+                # Lấy checkpoint mới nhất (tên lớn nhất, ví dụ g_00400000)
+                latest_g = g_candidates[-1]
+                model_file = os.path.join(model_id, latest_g)
+                print(f"Using training-style generator checkpoint: {latest_g}")
+
         else:
             print(f"Loading weights from {model_id}")
             model_file = hf_hub_download(
@@ -479,15 +500,25 @@ class BigVGAN(
                 local_files_only=local_files_only,
             )
 
+
         checkpoint_dict = torch.load(model_file, map_location=map_location)
 
+        # Tùy cấu trúc checkpoint mà lấy cho đúng
+        if "generator" in checkpoint_dict:
+            state_dict = checkpoint_dict["generator"]
+        else:
+            # Trường hợp file chỉ chứa state_dict của generator
+            state_dict = checkpoint_dict
+
         try:
-            model.load_state_dict(checkpoint_dict["generator"])
+            model.load_state_dict(state_dict, strict=strict)
         except RuntimeError:
             print(
-                f"[INFO] the pretrained checkpoint does not contain weight norm. Loading the checkpoint after removing weight norm!"
+                f"[INFO] the pretrained checkpoint does not contain weight norm. "
+                f"Loading the checkpoint after removing weight norm!"
             )
             model.remove_weight_norm()
-            model.load_state_dict(checkpoint_dict["generator"])
+            model.load_state_dict(state_dict, strict=strict)
 
         return model
+
